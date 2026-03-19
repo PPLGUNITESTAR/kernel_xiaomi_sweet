@@ -146,9 +146,10 @@ jobs:
         run: |
           echo "⚠️ INITIATING KSU_BLXX PROTOCOL ..."
 
-          # Umount backport + kpatch fix (ported dari build.sh add_ksu)
-          wget -qO- "${{ env.KSU_UMOUNT_PATCH }}" | patch -p1 --fuzz=3
-          wget -qO- "${{ env.KSU_KPATCH_FIX }}"   | patch -p1 --fuzz=3
+          # Umount backport + kpatch fix
+          # --forward: skip kalau patch sudah ada di tree (reversed detected = sudah applied)
+          wget -qO- "${{ env.KSU_UMOUNT_PATCH }}" | patch -p1 --fuzz=3 --forward || true
+          wget -qO- "${{ env.KSU_KPATCH_FIX }}"   | patch -p1 --fuzz=3 --forward || true
 
           # Setup KernelSU (hookless mode)
           curl -LSs "${{ env.KSU_BLXX_SETUP_URI }}" | bash -s ${{ env.KSU_BLXX_BRANCH }}
@@ -173,8 +174,9 @@ jobs:
           echo "⚠️ INITIATING KSU_NEXT PROTOCOL ..."
 
           # Umount backport + kpatch fix
-          wget -qO- "${{ env.KSU_UMOUNT_PATCH }}" | patch -p1 --fuzz=3
-          wget -qO- "${{ env.KSU_KPATCH_FIX }}"   | patch -p1 --fuzz=3
+          # --forward: skip kalau patch sudah ada di tree (reversed detected = sudah applied)
+          wget -qO- "${{ env.KSU_UMOUNT_PATCH }}" | patch -p1 --fuzz=3 --forward || true
+          wget -qO- "${{ env.KSU_KPATCH_FIX }}"   | patch -p1 --fuzz=3 --forward || true
 
           # Apply inline hook patch
           curl -LSs "${{ env.KSU_NEXT_HOOK_PATCH }}" | bash
