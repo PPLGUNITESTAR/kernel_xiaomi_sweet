@@ -146,9 +146,18 @@ jobs:
         run: |
           echo "⚠️ INITIATING KSU_BLXX PROTOCOL ..."
 
-          # Umount backport + kpatch fix (ported dari build.sh add_ksu)
-          wget -qO- "${{ env.KSU_UMOUNT_PATCH }}" | patch -p1 --fuzz=3
-          wget -qO- "${{ env.KSU_KPATCH_FIX }}"   | patch -p1 --fuzz=3
+          # apply_patch: download ke file dulu lalu patch --batch --forward
+          # --batch  = jangan prompt interaktif sama sekali
+          # --forward = skip kalau patch sudah applied (reversed detected), bukan error
+          apply_patch() {
+            local URL="$1"
+            local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
+            wget -q "$URL" -O "$PATCHFILE"
+            patch -p1 --fuzz=3 --batch --forward < "$PATCHFILE" || true
+            rm -f "$PATCHFILE"
+          }
+          apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
+          apply_patch "${{ env.KSU_KPATCH_FIX }}"
 
           # Setup KernelSU (hookless mode)
           curl -LSs "${{ env.KSU_BLXX_SETUP_URI }}" | bash -s ${{ env.KSU_BLXX_BRANCH }}
@@ -172,9 +181,18 @@ jobs:
         run: |
           echo "⚠️ INITIATING KSU_NEXT PROTOCOL ..."
 
-          # Umount backport + kpatch fix
-          wget -qO- "${{ env.KSU_UMOUNT_PATCH }}" | patch -p1 --fuzz=3
-          wget -qO- "${{ env.KSU_KPATCH_FIX }}"   | patch -p1 --fuzz=3
+          # apply_patch: download ke file dulu lalu patch --batch --forward
+          # --batch  = jangan prompt interaktif sama sekali
+          # --forward = skip kalau patch sudah applied (reversed detected), bukan error
+          apply_patch() {
+            local URL="$1"
+            local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
+            wget -q "$URL" -O "$PATCHFILE"
+            patch -p1 --fuzz=3 --batch --forward < "$PATCHFILE" || true
+            rm -f "$PATCHFILE"
+          }
+          apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
+          apply_patch "${{ env.KSU_KPATCH_FIX }}"
 
           # Apply inline hook patch
           curl -LSs "${{ env.KSU_NEXT_HOOK_PATCH }}" | bash
@@ -312,26 +330,11 @@ jobs:
 
           make O=out ${{ env.DEFCONFIG }}
 
-          # Jalankan make, pipe stderr ke tee supaya tetap keliatan di log
-          # Setelah selesai (sukses atau gagal), filter dan tampilkan hanya error lines
-          set -o pipefail
           make -j$(nproc --all) O=out \
             LLVM=1 LLVM_IAS=1 CC="ccache clang" \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            Image.gz dtbo.img dtb.img \
-            2>&1 | tee /tmp/build_full.log; BUILD_EXIT=${PIPESTATUS[0]}
-
-          # Kalau gagal, extract dan tampilkan hanya error lines
-          if [ "$BUILD_EXIT" != "0" ]; then
-            echo ""
-            echo "════════════════════════════════════════════════════════"
-            echo "  ❌ BUILD FAILED — EXTRACTED ERRORS:"
-            echo "════════════════════════════════════════════════════════"
-            grep -E "error:|Error|undefined reference|ld.lld:|clang.*error" /tmp/build_full.log | grep -v "^--$" || true
-            echo "════════════════════════════════════════════════════════"
-            exit $BUILD_EXIT
-          fi
+            Image.gz dtbo.img dtb.img
 
       - name: "📊 [STATS] :: CCACHE_REPORT"
         run: ccache -s
