@@ -216,123 +216,44 @@ jobs:
           echo "⚠️ APPLYING SUSFS (simonpunk/susfs4ksu, kernel-4.14) ..."
           git clone -q --depth=1 -b "${{ env.SUSFS_BRANCH }}" "${{ env.SUSFS_REPO }}" susfs4ksu
 
-          # Step 1: Copy SUSFS source files langsung — zero patch conflict
+          # Step 1: Copy SUSFS source files — zero patch conflict
           echo "Copying SUSFS source files..."
           cp -v susfs4ksu/kernel_patches/fs/susfs.c                   fs/
           cp -v susfs4ksu/kernel_patches/include/linux/susfs.h        include/linux/
           cp -v susfs4ksu/kernel_patches/include/linux/susfs_def.h    include/linux/
 
-          # Step 2: KSU-side enablement patch (ke folder KernelSU jika ada)
+          # Step 2: KSU-side enablement patch
           KSU_ENABLE_PATCH="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
           if [ -f "$KSU_ENABLE_PATCH" ] && [ -d "KernelSU" ]; then
             echo "Applying KSU-side SUSFS enablement patch..."
-            patch -p1 -d KernelSU < "$KSU_ENABLE_PATCH" --fuzz=3 || {
-              echo "⚠️ KSU-side patch had issues, continuing..."
-            }
+            patch -p1 -d KernelSU < "$KSU_ENABLE_PATCH" --fuzz=3 || true
           fi
 
           # Step 3: Apply kernel-side SUSFS patch
-          # --batch --forward: skip hunks yang sudah applied (cred.h/cred.c sudah ada di tree ini)
+          # --batch --forward: skip hunks sudah applied (cred.h/cred.c native di tree ini)
           SUSFS_KPATCH="susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch"
           echo "Applying kernel-side SUSFS patch..."
           patch -p1 --fuzz=3 --batch --forward < "$SUSFS_KPATCH" || true
 
-          # Step 4: Manual fix untuk reject yang diketahui di kernel sweet/sm6150
+          # Step 4: Manual fix untuk known rejects di kernel sweet/sm6150
           echo "Applying manual fixes for known rejects..."
-          python3 << 'PYEOF'
-          import re, sys
-
-          # ── Fix A: kernel/sys.c ──────────────────────────────────────────────
-          # Patch SUSFS mau inject susfs_spoof_uname() di SYSCALL_DEFINE1(newuname)
-          # tapi hunk gagal karena offset berbeda. Kita inject manual via regex.
-          print("Fixing kernel/sys.c ...")
-          with open("kernel/sys.c", "r") as f:
-              sys_c = f.read()
-
-          # Cek apakah sudah ada (idempotent)
-          if "susfs_spoof_uname" not in sys_c:
-              # Inject extern declaration + call sebelum up_read(&uts_sem)
-              old_block = (
-                  "down_read(&uts_sem);
-"
-                  "	memcpy(&tmp, utsname(), sizeof(tmp));
-"
-                  "	up_read(&uts_sem);"
-              )
-              new_block = (
-                  "down_read(&uts_sem);
-"
-                  "	memcpy(&tmp, utsname(), sizeof(tmp));
-"
-                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-"
-                  "	susfs_spoof_uname(&tmp);
-"
-                  "#endif
-"
-                  "	up_read(&uts_sem);"
-              )
-              # Tambah extern declaration sebelum SYSCALL_DEFINE1(newuname)
-              extern_decl = (
-                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-"
-                  "extern void susfs_spoof_uname(struct new_utsname* tmp);
-"
-                  "#endif
-"
-                  "SYSCALL_DEFINE1(newuname,"
-              )
-              if old_block in sys_c:
-                  sys_c = sys_c.replace("SYSCALL_DEFINE1(newuname,", extern_decl, 1)
-                  sys_c = sys_c.replace(old_block, new_block, 1)
-                  with open("kernel/sys.c", "w") as f:
-                      f.write(sys_c)
-                  print("  ✅ kernel/sys.c patched")
-              else:
-                  print("  ⚠️  kernel/sys.c: anchor not found, skipping (may already be patched differently)")
-          else:
-              print("  ✅ kernel/sys.c: already patched, skipping")
-
-          # ── Fix B: fs/open.c ─────────────────────────────────────────────────
-          # susfs_is_current_proc_umounted() dipanggil tapi deklarasinya tidak masuk
-          # karena hunk di fs/open.c juga mungkin offset. Pastikan include susfs.h ada.
-          print("Fixing fs/open.c ...")
-          with open("fs/open.c", "r") as f:
-              open_c = f.read()
-
-          if "susfs.h" not in open_c and "susfs_is_current_proc_umounted" in open_c:
-              # Tambah include di baris pertama setelah linux/fs.h
-              open_c = open_c.replace(
-                  "#include <linux/fs.h>",
-                  "#include <linux/fs.h>
-#include <linux/susfs.h>",
-                  1
-              )
-              with open("fs/open.c", "w") as f:
-                  f.write(open_c)
-              print("  ✅ fs/open.c: added susfs.h include")
-          elif "susfs_is_current_proc_umounted" not in open_c:
-              print("  ⚠️  fs/open.c: susfs call not found — SUSFS patch may not have applied to this file")
-              sys.exit(1)
-          else:
-              print("  ✅ fs/open.c: already OK")
-          PYEOF
+          python3 ${{ github.workspace }}/susfs_manual_fix.py
 
           # Step 5: Append SUSFS configs ke defconfig
           echo "Appending SUSFS configs to defconfig..."
-          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=n
-CONFIG_KSU_SUSFS_SUS_MOUNT=n
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_SUS_MAP=y
-CONFIG_KSU_SUSFS_TRY_UMOUNT=n
-EOF
+          printf '%s\n' \
+            'CONFIG_KSU_SUSFS=y' \
+            'CONFIG_KSU_SUSFS_SUS_PATH=n' \
+            'CONFIG_KSU_SUSFS_SUS_MOUNT=n' \
+            'CONFIG_KSU_SUSFS_SUS_KSTAT=y' \
+            'CONFIG_KSU_SUSFS_SPOOF_UNAME=y' \
+            'CONFIG_KSU_SUSFS_ENABLE_LOG=y' \
+            'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' \
+            'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y' \
+            'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y' \
+            'CONFIG_KSU_SUSFS_SUS_MAP=y' \
+            'CONFIG_KSU_SUSFS_TRY_UMOUNT=n' \
+            >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
           echo "✅ SUSFS integration complete."
 
