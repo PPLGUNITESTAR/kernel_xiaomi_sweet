@@ -330,11 +330,23 @@ jobs:
 
           make O=out ${{ env.DEFCONFIG }}
 
+          set -o pipefail
           make -j$(nproc --all) O=out \
             LLVM=1 LLVM_IAS=1 CC="ccache clang" \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            Image.gz dtbo.img dtb.img
+            Image.gz dtbo.img dtb.img \
+            2>&1 | tee /tmp/build_full.log; BUILD_EXIT=${PIPESTATUS[0]}
+
+          if [ "$BUILD_EXIT" != "0" ]; then
+            echo ""
+            echo "════════════════════════════════════════════════════════"
+            echo "  ❌ BUILD FAILED — EXTRACTED ERRORS:"
+            echo "════════════════════════════════════════════════════════"
+            grep -E "error:|undefined reference|ld.lld:|clang.*error" /tmp/build_full.log | grep -v "warning:" | grep -v "^--$" || true
+            echo "════════════════════════════════════════════════════════"
+            exit $BUILD_EXIT
+          fi
 
       - name: "📊 [STATS] :: CCACHE_REPORT"
         run: ccache -s
