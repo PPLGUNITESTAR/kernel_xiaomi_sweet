@@ -3,13 +3,13 @@
 susfs_manual_fix.py
 Manual patch applicator untuk known rejects SUSFS di kernel sweet (sm6150/SDM732).
 
-Dijalankan setelah `patch --batch --forward` di step SUSFS_INTEGRATION.
-Dua fix:
-  A) kernel/sys.c  — inject susfs_spoof_uname() call ke SYSCALL_DEFINE1(newuname)
-  B) fs/open.c     — pastikan #include <linux/susfs.h> ada kalau susfs call sudah masuk
+Fix:
+  A) kernel/sys.c  — inject susfs_spoof_uname() ke SYSCALL_DEFINE1(newuname)
+  B) fs/open.c     — inject #include <linux/susfs.h> supaya susfs calls bisa resolve
+  C) Verify pass   — scan semua .c file yang punya susfs calls tapi belum include susfs.h
 """
 
-import sys
+import sys, os, re
 
 # ── Fix A: kernel/sys.c ──────────────────────────────────────────────────────
 print("Fixing kernel/sys.c ...")
@@ -17,7 +17,6 @@ with open("kernel/sys.c", "r") as f:
     data = f.read()
 
 if "susfs_spoof_uname" not in data:
-    # Anchor: blok down_read/memcpy/up_read di dalam newuname syscall
     anchor = "\tdown_read(&uts_sem);\n\tmemcpy(&tmp, utsname(), sizeof(tmp));\n\tup_read(&uts_sem);"
     replacement = (
         "\tdown_read(&uts_sem);\n"
@@ -41,28 +40,72 @@ if "susfs_spoof_uname" not in data:
             f.write(data)
         print("  OK  kernel/sys.c patched")
     else:
-        print("  WARN kernel/sys.c anchor not found — may already be patched differently, skipping")
+        print("  WARN kernel/sys.c anchor not found — skipping")
 else:
-    print("  OK  kernel/sys.c already patched, skipping")
+    print("  OK  kernel/sys.c already patched")
 
-# ── Fix B: fs/open.c ─────────────────────────────────────────────────────────
-print("Fixing fs/open.c ...")
-with open("fs/open.c", "r") as f:
-    data = f.read()
+# ── Fix B+C: scan semua .c yang punya susfs calls tapi belum include susfs.h ─
+# Ini cover fs/open.c dan file lain yang mungkin diinject oleh susfs_inline_hook_patches.sh
+print("\nScanning for missing susfs.h includes ...")
 
-if "susfs_is_current_proc_umounted" in data and "#include <linux/susfs.h>" not in data:
-    data = data.replace(
-        "#include <linux/fs.h>",
-        "#include <linux/fs.h>\n#include <linux/susfs.h>",
-        1
-    )
-    with open("fs/open.c", "w") as f:
-        f.write(data)
-    print("  OK  fs/open.c susfs.h include added")
-elif "susfs_is_current_proc_umounted" not in data:
-    print("  WARN fs/open.c susfs call not found — SUSFS patch may not have applied to this file")
-    sys.exit(1)
-else:
-    print("  OK  fs/open.c already OK")
+INCLUDE_ANCHORS = [
+    "#include <linux/fs.h>",
+    "#include <linux/file.h>",
+    "#include <linux/fdtable.h>",
+    "#include <linux/namei.h>",
+    "#include <linux/kernel.h>",
+    "#include <linux/slab.h>",
+    "#include <linux/mm.h>",
+]
 
-print("Manual fixes done.")
+def inject_susfs_include(fpath):
+    with open(fpath, "r", errors="replace") as f:
+        content = f.read()
+    if "#include <linux/susfs.h>" in content:
+        return "already"
+    # Cari anchor terbaik
+    for anchor in INCLUDE_ANCHORS:
+        if anchor in content:
+            content = content.replace(anchor, anchor + "\n#include <linux/susfs.h>", 1)
+            with open(fpath, "w") as f:
+                f.write(content)
+            return f"injected after '{anchor}'"
+    # Fallback: setelah include terakhir
+    lines = content.split("\n")
+    last_inc = max((i for i, l in enumerate(lines) if l.startswith("#include ")), default=None)
+    if last_inc is not None:
+        lines.insert(last_inc + 1, "#include <linux/susfs.h>")
+        with open(fpath, "w") as f:
+            f.write("\n".join(lines))
+        return "injected (fallback after last include)"
+    return "FAILED no anchor found"
+
+found = False
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in ("susfs4ksu", "out", ".git")]
+    for fname in files:
+        if not fname.endswith(".c"):
+            continue
+        fpath = os.path.join(root, fname)
+        try:
+            with open(fpath, "r", errors="replace") as f:
+                content = f.read()
+        except Exception:
+            continue
+        if "#include <linux/susfs.h>" in content:
+            continue
+        calls = re.findall(r'\bsusfs_\w+\s*\(', content)
+        if not calls:
+            continue
+        found = True
+        result = inject_susfs_include(fpath)
+        if "FAILED" in result:
+            print(f"  ERR {fpath}: {result}")
+            sys.exit(1)
+        else:
+            print(f"  OK  {fpath}: {result} (calls: {calls[:3]})")
+
+if not found:
+    print("  OK  No files need susfs.h injection")
+
+print("\nManual fixes done.")
