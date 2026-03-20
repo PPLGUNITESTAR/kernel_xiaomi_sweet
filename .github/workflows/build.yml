@@ -43,9 +43,8 @@ env:
   KSU_UMOUNT_PATCH: "https://github.com/tbyool/android_kernel_xiaomi_sm6150/commit/64db0dfa2f8aa6c519dbf21eb65c9b89643cda3d.patch"
   KSU_KPATCH_FIX: "https://github.com/TheSillyOk/kernel_ls_patches/raw/refs/heads/master/kpatch_fix.patch"
 
-  # --- SUSFS (simonpunk/susfs4ksu, kernel-4.14) ---
-  SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
-  SUSFS_BRANCH: "kernel-4.14"
+  # --- SUSFS (JackA1ltman patch, 4.14) ---
+  SUSFS_PATCH_URL: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd/raw/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.14.patch"
 
 jobs:
   # ------------------------------------------------------------------
@@ -203,43 +202,27 @@ jobs:
           # Manual config enablement
           cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
           CONFIG_KSU=y
-          KSU_MANUAL_HOOK=y
-          EOF
-
-      # ----------------------------------------------------------------
+       # ----------------------------------------------------------------
       # SUSFS — apply untuk KSU_BLXX dan KSU_NEXT
-      # Sumber: simonpunk/susfs4ksu kernel-4.14
+      # Patch: JackA1ltman/NonGKI_Kernel_Build_2nd susfs_patch_to_4.14.patch
       # ----------------------------------------------------------------
       - name: "🩹 [PATCH] :: SUSFS_INTEGRATION"
         if: inputs.ksu_selector != 'NONE'
         run: |
-          echo "⚠️ APPLYING SUSFS (simonpunk/susfs4ksu, kernel-4.14) ..."
-          git clone -q --depth=1 -b "${{ env.SUSFS_BRANCH }}" "${{ env.SUSFS_REPO }}" susfs4ksu
+          echo "⚠️ APPLYING SUSFS patch (JackA1ltman, 4.14) ..."
 
-          # Step 1: Copy SUSFS source files — zero patch conflict
-          echo "Copying SUSFS source files..."
-          cp -v susfs4ksu/kernel_patches/fs/susfs.c                   fs/
-          cp -v susfs4ksu/kernel_patches/include/linux/susfs.h        include/linux/
-          cp -v susfs4ksu/kernel_patches/include/linux/susfs_def.h    include/linux/
+          # Download patch ke file — hindari stdin closed issue saat pipe
+          wget -q "${{ env.SUSFS_PATCH_URL }}" -O /tmp/susfs.patch
 
-          # Step 2: KSU-side enablement patch
-          KSU_ENABLE_PATCH="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-          if [ -f "$KSU_ENABLE_PATCH" ] && [ -d "KernelSU" ]; then
-            echo "Applying KSU-side SUSFS enablement patch..."
-            patch -p1 -d KernelSU < "$KSU_ENABLE_PATCH" --fuzz=3 || true
-          fi
+          # Apply dengan --batch --forward:
+          # --batch  = no interactive prompt
+          # --forward = skip hunk yang sudah applied (cred.h/cred.c native di tree ini)
+          patch -p1 --fuzz=5 --batch --forward < /tmp/susfs.patch || true
 
-          # Step 3: Apply kernel-side SUSFS patch
-          # --batch --forward: skip hunks sudah applied (cred.h/cred.c native di tree ini)
-          SUSFS_KPATCH="susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch"
-          echo "Applying kernel-side SUSFS patch..."
-          patch -p1 --fuzz=3 --batch --forward < "$SUSFS_KPATCH" || true
-
-          # Step 4: Manual fix untuk known rejects di kernel sweet/sm6150
-          echo "Applying manual fixes for known rejects..."
+          # Fix known reject: kernel/sys.c — inject susfs_spoof_uname() manual
           python3 ${{ github.workspace }}/susfs_manual_fix.py
 
-          # Step 5: Append SUSFS configs ke defconfig
+          # Append SUSFS configs ke defconfig
           echo "Appending SUSFS configs to defconfig..."
           printf '%s\n' \
             'CONFIG_KSU_SUSFS=y' \
@@ -255,7 +238,7 @@ jobs:
             'CONFIG_KSU_SUSFS_TRY_UMOUNT=n' \
             >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
-          echo "✅ SUSFS integration complete."
+          echo "✅ SUSFS integration complete."      echo "✅ SUSFS integration complete."
 
       - name: "📤 [DEBUG] :: UPLOAD_SUSFS_REJECTS"
         if: failure()
