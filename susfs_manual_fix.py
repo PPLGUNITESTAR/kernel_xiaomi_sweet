@@ -2,11 +2,6 @@
 """
 susfs_manual_fix.py
 Manual patch applicator untuk known rejects SUSFS di kernel sweet (sm6150/SDM732).
-
-Fix:
-  A) kernel/sys.c      — inject susfs_spoof_uname() ke SYSCALL_DEFINE1(newuname)
-  B) fs/proc/task_mmu.c — inject label bypass_orig_flow yang gagal di hunk #5
-  C) Verify/inject susfs.h include ke semua .c yang punya susfs calls
 """
 
 import sys, os, re
@@ -45,84 +40,111 @@ else:
     print("  OK  kernel/sys.c already patched")
 
 # ── Fix B: fs/proc/task_mmu.c — bypass_orig_flow label ──────────────────────
-# Hunk #5 dari SUSFS patch gagal apply (offset terlalu jauh).
-# Hunk itu menambahkan label `bypass_orig_flow:` setelah blok susfs_show_map_vma_spoofer.
-# Hunk lain yang inject `goto bypass_orig_flow;` berhasil masuk → compile error.
+# Problem: patch inject `goto bypass_orig_flow` berhasil (hunk #4),
+# tapi hunk #5 yang inject label `bypass_orig_flow:` gagal apply.
+# Akibatnya label masuk di tempat yang salah (fungsi berbeda) atau tidak masuk sama sekali.
 #
-# Dari patch original, struktur yang diinject:
-#   if (susfs_show_map_vma_spoofer(m, vma))
-#       goto bypass_orig_flow;
-#   ... (kode original) ...
-#   bypass_orig_flow:    <- label ini yang gagal
+# Fix: hapus label yang salah posisi (jika ada), lalu inject ulang di tempat yang
+# benar — yaitu tepat setelah closing brace dari blok yang berisi goto.
 #
-# Kita cari `goto bypass_orig_flow;` lalu trace ke akhir blok if/for yang sama,
-# kemudian inject label di sana.
+# Struktur di task_mmu.c setelah patch (dari SUSFS pattern 4.14):
+#   show_map_vma(struct seq_file *m, struct vm_area_struct *vma, ...) {
+#     ...
+#     if (susfs_show_map_vma_spoofer(m, vma))
+#         goto bypass_orig_flow;       <- line ~1046
+#     ... [existing show_map_vma body] ...
+#     bypass_orig_flow:                <- label harus di sini, sebelum closing }
+#   }
+#
 print("Fixing fs/proc/task_mmu.c ...")
 with open("fs/proc/task_mmu.c", "r") as f:
-    data = f.read()
+    content = f.read()
 
-if "bypass_orig_flow" in data and "bypass_orig_flow:" not in data:
-    # Cari posisi goto
-    goto_idx = data.find("goto bypass_orig_flow;")
-    if goto_idx == -1:
-        print("  WARN goto bypass_orig_flow not found")
-    else:
-        # Cari akhir dari blok/statement setelah goto — yaitu `show_map_vma_end:` label
-        # atau closing brace dari fungsi show_smaps_rollup / show_map_vma
-        # Anchor yang paling aman: cari `show_map_vma_end:` atau akhir scope terdekat
-        # Dari patch: label ditempatkan tepat sebelum `show_map_vma_end:` atau sebelum
-        # baris `m_start(m, pos)` atau sebelum closing brace fungsi
-        #
-        # Strategi: cari anchor terdekat setelah goto yang merupakan label atau closing scope
-        search_region = data[goto_idx:]
+goto_present   = "goto bypass_orig_flow;" in content
+label_present  = "bypass_orig_flow:" in content
 
-        # Anchor kandidat — cari yang mana yang ada
-        candidates = [
-            "\nshow_map_vma_end:",          # label eksisting di fungsi
-            "\n\trelease_task(task);",       # statement khas di akhir fungsi
-            "\n\tput_task_struct(task);",
-            "\n\ttask_unlock(task);",
-            "\n\treturn 0;\n}",              # return terakhir di fungsi
-        ]
+if not goto_present:
+    print("  OK  fs/proc/task_mmu.c no goto present, nothing to fix")
+elif goto_present and label_present:
+    # Label ada — tapi mungkin di fungsi yang salah. Cek apakah goto dan label
+    # ada di dalam fungsi yang SAMA dengan cara mencari function boundary.
+    lines = content.split("\n")
+    goto_line  = next(i for i, l in enumerate(lines) if "goto bypass_orig_flow;" in l)
+    label_line = next(i for i, l in enumerate(lines) if "bypass_orig_flow:" in l and "goto" not in l)
 
-        inject_before = None
-        inject_pos = None
-        for cand in candidates:
-            idx = search_region.find(cand)
-            if idx != -1:
-                inject_before = cand
-                inject_pos = goto_idx + idx
+    # Temukan fungsi yang mengandung goto_line
+    # Cari opening brace fungsi ke atas dari goto_line
+    func_start = None
+    brace_depth = 0
+    for i in range(goto_line, -1, -1):
+        brace_depth += lines[i].count('}') - lines[i].count('{')
+        if brace_depth > 0:
+            func_start = i
+            break
+
+    # Temukan closing brace fungsi (func_end) dari goto_line ke bawah
+    brace_depth = 0
+    func_end = None
+    for i in range(goto_line, len(lines)):
+        brace_depth += lines[i].count('{') - lines[i].count('}')
+        if brace_depth < 0:
+            func_end = i
+            break
+
+    if func_start is not None and func_end is not None and not (func_start <= label_line <= func_end):
+        print(f"  WARN label at line {label_line+1} is OUTSIDE function scope ({func_start+1}..{func_end+1})")
+        print(f"  Removing misplaced label and re-injecting...")
+
+        # Hapus baris label yang salah
+        lines = [l for i, l in enumerate(lines) if not (i == label_line and "bypass_orig_flow:" in l and "goto" not in l)]
+
+        # Inject label tepat sebelum closing brace fungsi (func_end - 1 setelah delete)
+        # Recalculate func_end setelah delete
+        content_tmp = "\n".join(lines)
+        lines = content_tmp.split("\n")
+
+        goto_line2 = next(i for i, l in enumerate(lines) if "goto bypass_orig_flow;" in l)
+        brace_depth = 0
+        func_end2 = None
+        for i in range(goto_line2, len(lines)):
+            brace_depth += lines[i].count('{') - lines[i].count('}')
+            if brace_depth < 0:
+                func_end2 = i
                 break
 
-        if inject_pos is not None:
-            label_code = "\nbypass_orig_flow:\n"
-            data = data[:inject_pos] + label_code + data[inject_pos:]
+        if func_end2 is not None:
+            lines.insert(func_end2, "bypass_orig_flow:")
+            content = "\n".join(lines)
             with open("fs/proc/task_mmu.c", "w") as f:
-                f.write(data)
-            print(f"  OK  fs/proc/task_mmu.c: bypass_orig_flow label injected before '{inject_before.strip()}'")
+                f.write(content)
+            print(f"  OK  fs/proc/task_mmu.c label re-injected before line {func_end2+1}")
         else:
-            # Fallback: inject tepat setelah goto statement + satu baris
-            # Ini less precise tapi compile akan OK
-            lines = data.split("\n")
-            for i, line in enumerate(lines):
-                if "goto bypass_orig_flow;" in line:
-                    # Cari akhir blok — scan maju sampai indentasi kembali ke level yang sama
-                    base_indent = len(line) - len(line.lstrip())
-                    for j in range(i + 1, min(i + 200, len(lines))):
-                        stripped = lines[j].strip()
-                        curr_indent = len(lines[j]) - len(lines[j].lstrip()) if lines[j].strip() else base_indent + 1
-                        if stripped and curr_indent <= base_indent and not stripped.startswith("//"):
-                            lines.insert(j, "bypass_orig_flow:")
-                            print(f"  OK  fs/proc/task_mmu.c: bypass_orig_flow injected at line {j} (fallback)")
-                            break
-                    break
-            data = "\n".join(lines)
-            with open("fs/proc/task_mmu.c", "w") as f:
-                f.write(data)
-elif "bypass_orig_flow:" in data:
-    print("  OK  fs/proc/task_mmu.c already has bypass_orig_flow label")
-elif "bypass_orig_flow" not in data:
-    print("  OK  fs/proc/task_mmu.c no bypass_orig_flow reference (patch may not have applied)")
+            print("  ERR could not find function end")
+            sys.exit(1)
+    else:
+        print(f"  OK  fs/proc/task_mmu.c goto (line {goto_line+1}) and label (line {label_line+1}) in same function")
+
+elif goto_present and not label_present:
+    # Label belum ada sama sekali — inject sebelum closing brace fungsi yang punya goto
+    print("  Label missing entirely, injecting...")
+    lines = content.split("\n")
+    goto_line = next(i for i, l in enumerate(lines) if "goto bypass_orig_flow;" in l)
+    brace_depth = 0
+    func_end = None
+    for i in range(goto_line, len(lines)):
+        brace_depth += lines[i].count('{') - lines[i].count('}')
+        if brace_depth < 0:
+            func_end = i
+            break
+    if func_end is not None:
+        lines.insert(func_end, "bypass_orig_flow:")
+        content = "\n".join(lines)
+        with open("fs/proc/task_mmu.c", "w") as f:
+            f.write(content)
+        print(f"  OK  fs/proc/task_mmu.c label injected before closing brace at line {func_end+1}")
+    else:
+        print("  ERR cannot find function end")
+        sys.exit(1)
 
 # ── Fix C: scan semua .c yang punya susfs calls tapi belum include susfs.h ───
 print("\nScanning for missing susfs.h includes ...")
@@ -148,7 +170,6 @@ def inject_susfs_include(fpath):
             with open(fpath, "w") as f:
                 f.write(content)
             return f"injected after '{anchor}'"
-    # Fallback: setelah include terakhir
     lines = content.split("\n")
     last_inc = max((i for i, l in enumerate(lines) if l.startswith("#include ")), default=None)
     if last_inc is not None:
@@ -167,12 +188,12 @@ for root, dirs, files in os.walk("."):
         fpath = os.path.join(root, fname)
         try:
             with open(fpath, "r", errors="replace") as f:
-                content = f.read()
+                fc = f.read()
         except Exception:
             continue
-        if "#include <linux/susfs.h>" in content:
+        if "#include <linux/susfs.h>" in fc:
             continue
-        calls = re.findall(r'\bsusfs_\w+\s*\(', content)
+        calls = re.findall(r'\bsusfs_\w+\s*\(', fc)
         if not calls:
             continue
         found = True
